@@ -1,0 +1,530 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<title>スペースインベーダー</title>
+<style>
+body {
+  background-color: black;
+  margin: 0;
+  overflow: hidden;
+  color: #00ff00;
+  font-family: 'Courier New', Courier, monospace;
+}
+canvas {
+  display: block;
+  margin: 0 auto;
+  background-color: black;
+}
+#overlay {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: #00ff00;
+  font-size: 32px;
+  background-color: rgba(0,0,0,0.8);
+  z-index: 10;
+  flex-direction: column;
+}
+#overlay div {
+  margin: 5px;
+}
+</style>
+</head>
+<body>
+<canvas id="gameCanvas" width="800" height="600"></canvas>
+<div id="overlay"><div>スペースインベーダー</div><div>Enterキーで開始</div></div>
+<script>
+(function() {
+  const canvas = document.getElementById('gameCanvas');
+  const ctx = canvas.getContext('2d');
+
+  const overlay = document.getElementById('overlay');
+
+  /* ===== 追加：スコア描画用の定数 ===== */
+  const SCORE_FONT_SIZE   = 28;                // 文字サイズ
+  const SCORE_LINE_HEIGHT = SCORE_FONT_SIZE+6; // 行間
+
+  // Game state
+  let score = 0;
+  let lives = 3;
+  let level = 1;
+  let aliens = [];
+  let alienDir = 1; // 1 right, -1 left
+  let alienMoveInterval = 600; // ms, will decrease as aliens killed
+  let lastAlienMove = 0;
+  let baseAlienInterval = 600;
+  const alienStepX = 10;
+  const alienStepY = 20;
+  let player = { width: 50, height: 30, x: canvas.width/2 - 25, y: canvas.height - 60, speed: 6 };
+  let playerBullet = null;
+  let alienBullets = [];
+  let bunkers = [];
+  let lastAlienShoot = 0;
+  let keys = {};
+  let gameState = 'waiting'; // waiting, playing, gameover
+  let audioCtx;
+  let movementBeepIndex = 0;
+  const movementFrequencies = [200, 250, 300, 350];
+  let lastMysteryTime = 0;
+  const mysteryInterval = 20000; // 20 seconds
+  let mysteryShip = null;
+  let activeMystery = false;
+
+  let justKilledAlien = false;
+
+  function initAudio() {
+    if (!audioCtx) {
+      audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    }
+  }
+
+  function playSound(frequency, duration=0.1, type='square', volume=0.2) {
+    initAudio();
+    if (audioCtx.state === 'suspended') {
+      audioCtx.resume();
+    }
+    const osc = audioCtx.createOscillator();
+    const gain = audioCtx.createGain();
+    osc.type = type;
+    osc.frequency.value = frequency;
+    gain.gain.value = volume;
+    osc.connect(gain);
+    gain.connect(audioCtx.destination);
+    osc.start();
+    osc.stop(audioCtx.currentTime + duration);
+  }
+
+  function playMovementSound() {
+    const freq = movementFrequencies[movementBeepIndex];
+    playSound(freq, 0.05, 'square', 0.1);
+    movementBeepIndex = (movementBeepIndex + 1) % movementFrequencies.length;
+  }
+
+  function playShootSound() {
+    playSound(700, 0.05, 'square', 0.2);
+  }
+
+  function playAlienKilledSound() {
+    playSound(100, 0.3, 'sawtooth', 0.3);
+  }
+
+  function playPlayerKilledSound() {
+    playSound(60, 0.5, 'triangle', 0.4);
+  }
+
+  function playMysterySound() {
+    playSound(800, 0.1, 'square', 0.15);
+  }
+
+  function createAliens() {
+    aliens = [];
+    const rows = 5;
+    const cols = 11;
+    const spacingX = 50;
+    const spacingY = 40;
+    const startX = 60;
+    const startY = 80;
+    const alienW = 30;
+    const alienH = 24;
+    for (let r = 0; r < rows; r++) {
+      for (let c = 0; c < cols; c++) {
+        aliens.push({
+          x: startX + c * spacingX,
+          y: startY + r * spacingY,
+          width: alienW,
+          height: alienH,
+          row: r,
+          alive: true
+        });
+      }
+    }
+    alienDir = 1;
+    baseAlienInterval = Math.max(300, 800 - (level - 1) * 60);
+    alienMoveInterval = baseAlienInterval;
+    lastAlienMove = 0;
+  }
+
+  function createBunkers() {
+    bunkers = [];
+    const bunkerPositions = [80, 240, 400, 560];
+    const rows = 4;
+    const cols = 9;
+    const brickW = 8;
+    const brickH = 8;
+    bunkerPositions.forEach(posX => {
+      for (let r = 0; r < rows; r++) {
+        for (let c = 0; c < cols; c++) {
+          if ((r === 0 && (c < 2 || c > cols - 3)) ||
+              (r === 1 && (c === 0 || c === cols - 1)) ||
+              (r === rows - 1 && (c >= 3 && c <= 5))) {
+            continue;
+          }
+          const brick = {
+            x: posX + c * brickW,
+            y: canvas.height - 160 + r * brickH,
+            width: brickW,
+            height: brickH,
+            alive: true
+          };
+          bunkers.push(brick);
+        }
+      }
+    });
+  }
+
+  function resetGame() {
+    score = 0;
+    lives = 3;
+    level = 1;
+    createAliens();
+    createBunkers();
+    player = { width: 50, height: 30, x: canvas.width/2 - 25, y: canvas.height - 60, speed: 6 };
+    playerBullet = null;
+    alienBullets = [];
+    lastAlienShoot = 0;
+    lastMysteryTime = performance.now();
+    activeMystery = false;
+    mysteryShip = null;
+  }
+
+  function startGame() {
+    resetGame();
+    gameState = 'playing';
+    overlay.style.display = 'none';
+    initAudio();
+    if (audioCtx.state === 'suspended') {
+      audioCtx.resume();
+    }
+    requestAnimationFrame(gameLoop);
+  }
+
+  function endGame() {
+    gameState = 'gameover';
+    overlay.innerHTML = '<div>ゲームオーバー<br>スコア: ' + score + '</div><div>Enterキーで再開</div>';
+    overlay.style.display = 'flex';
+  }
+
+  function drawPlayer() {
+    ctx.fillStyle = '#00ff00';
+    ctx.fillRect(player.x, player.y, player.width, player.height);
+  }
+
+  function drawAliens() {
+    ctx.fillStyle = '#00ff00';
+    aliens.forEach(alien => {
+      if (alien.alive) {
+        ctx.fillRect(alien.x, alien.y, alien.width, alien.height);
+      }
+    });
+  }
+
+  function drawBunkers() {
+    ctx.fillStyle = '#00ff00';
+    bunkers.forEach(b => {
+      if (b.alive) {
+        ctx.fillRect(b.x, b.y, b.width, b.height);
+      }
+    });
+  }
+
+  function drawBullets() {
+    if (playerBullet) {
+      ctx.fillStyle = '#ffffff';
+      ctx.fillRect(playerBullet.x, playerBullet.y, playerBullet.width, playerBullet.height);
+    }
+    ctx.fillStyle = '#ff0000';
+    alienBullets.forEach(b => {
+      ctx.fillRect(b.x, b.y, b.width, b.height);
+    });
+  }
+
+  function drawMystery() {
+    if (mysteryShip) {
+      ctx.fillStyle = '#ff00ff';
+      ctx.fillRect(mysteryShip.x, mysteryShip.y, mysteryShip.width, mysteryShip.height);
+    }
+  }
+
+  /* ===== スコア描画を大きくする ===== */
+  function drawScore() {
+    ctx.fillStyle = '#00ff00';
+    ctx.font      = `${SCORE_FONT_SIZE}px Courier New`;
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'top';
+
+    ctx.fillText(`Score: ${score}`, 20, 20);
+    ctx.fillText(`Lives: ${lives}`, 20, 20 + SCORE_LINE_HEIGHT);
+    ctx.fillText(`Level: ${level}`, 20, 20 + SCORE_LINE_HEIGHT * 2);
+  }
+
+  const playerBulletWidth = 10;
+  const playerBulletHeight = 12;
+  const playerBulletSpeed = -8;
+
+  function updatePlayer() {
+    if (keys['ArrowLeft'] || keys['a']) {
+      player.x -= player.speed;
+      if (player.x < 0) player.x = 0;
+    }
+    if (keys['ArrowRight'] || keys['d']) {
+      player.x += player.speed;
+      if (player.x + player.width > canvas.width) player.x = canvas.width - player.width;
+    }
+    if (keys[' ']) {
+      if (!playerBullet) {
+        playerBullet = {
+          x: player.x + player.width / 2 - playerBulletWidth / 2,
+          y: player.y - playerBulletHeight,
+          width: playerBulletWidth,
+          height: playerBulletHeight,
+          dy: playerBulletSpeed
+        };
+        playShootSound();
+      }
+    }
+  }
+
+  function updatePlayerBullet() {
+    if (!playerBullet) return;
+    playerBullet.y += playerBullet.dy;
+    if (playerBullet.y + playerBullet.height < 0) {
+      playerBullet = null;
+      return;
+    }
+    let targetAlien = null;
+    for (let i = 0; i < aliens.length; i++) {
+      const alien = aliens[i];
+      if (!alien.alive) continue;
+      if (rectsIntersect(playerBullet, alien)) {
+        if (!targetAlien || alien.y > targetAlien.y) {
+          targetAlien = alien;
+        }
+      }
+    }
+    if (targetAlien) {
+      targetAlien.alive = false;
+      playerBullet = null;
+      const row = targetAlien.row;
+      let pts;
+      if (row === 0) pts = 40;
+      else if (row === 1) pts = 30;
+      else if (row === 2) pts = 20;
+      else pts = 10;
+      score += pts;
+      playAlienKilledSound();
+      const aliveCount = aliens.filter(a => a.alive).length;
+      const total = aliens.length;
+      alienMoveInterval = Math.max(80, baseAlienInterval - (total - aliveCount) * 10);
+      justKilledAlien = true;
+      return;
+    }
+    if (mysteryShip && rectsIntersect(playerBullet, mysteryShip)) {
+      const pts = 50 * (3 + Math.floor(Math.random() * 4));
+      score += pts;
+      playerBullet = null;
+      activeMystery = false;
+      mysteryShip = null;
+      playMysterySound();
+      return;
+    }
+    for (let i = 0; i < alienBullets.length; i++) {
+      const ab = alienBullets[i];
+      if (rectsIntersect(playerBullet, ab)) {
+        alienBullets.splice(i, 1);
+        playerBullet = null;
+        return;
+      }
+    }
+    for (let i = 0; i < bunkers.length; i++) {
+      const b = bunkers[i];
+      if (b.alive && rectsIntersect(playerBullet, b)) {
+        b.alive = false;
+        playerBullet = null;
+        return;
+      }
+    }
+  }
+
+  function updateAlienBullets() {
+    for (let i = alienBullets.length - 1; i >= 0; i--) {
+      const bullet = alienBullets[i];
+      bullet.y += bullet.dy;
+      if (bullet.y > canvas.height) {
+        alienBullets.splice(i, 1);
+        continue;
+      }
+      let hit = false;
+      for (let j = 0; j < bunkers.length; j++) {
+        const b = bunkers[j];
+        if (b.alive && rectsIntersect(bullet, b)) {
+          b.alive = false;
+          alienBullets.splice(i, 1);
+          hit = true;
+          break;
+        }
+      }
+      if (hit) continue;
+      if (rectsIntersect(bullet, player)) {
+        alienBullets.splice(i, 1);
+        lives--;
+        playPlayerKilledSound();
+        if (lives <= 0) {
+          endGame();
+        }
+      }
+    }
+  }
+
+  function updateAliens(currentTime) {
+    if (currentTime - lastAlienMove >= alienMoveInterval) {
+      let shouldMoveDown = false;
+      const dx = alienStepX * alienDir;
+      for (let i = 0; i < aliens.length; i++) {
+        const a = aliens[i];
+        if (!a.alive) continue;
+        const nextX = a.x + dx;
+        if (nextX < 10 || nextX + a.width > canvas.width - 10) {
+          shouldMoveDown = true;
+          alienDir *= -1;
+          break;
+        }
+      }
+      aliens.forEach(a => {
+        if (!a.alive) return;
+        if (shouldMoveDown) {
+          a.y += alienStepY;
+        } else {
+          a.x += dx;
+        }
+      });
+      playMovementSound();
+      lastAlienMove = currentTime;
+    }
+  }
+
+  function checkInvadersReachedBottom() {
+    for (const a of aliens) {
+      if (a.alive && a.y + a.height >= player.y) {
+        endGame();
+        return true;
+      }
+    }
+    return false;
+  }
+
+  function spawnAlienBullet(currentTime) {
+    const aliveCount = aliens.filter(a => a.alive).length;
+    const baseShoot = Math.max(500, 1200 - (aliens.length - aliveCount) * 15 - (level - 1) * 100);
+    if (currentTime - lastAlienShoot >= baseShoot) {
+      const bottomMap = {};
+      aliens.forEach(a => {
+        if (!a.alive) return;
+        const col = Math.round(a.x / 50);
+        if (!bottomMap[col] || a.y > bottomMap[col].y) {
+          bottomMap[col] = a;
+        }
+      });
+      const bottomAliens = Object.values(bottomMap);
+      if (bottomAliens.length > 0) {
+        const shooter = bottomAliens[Math.floor(Math.random() * bottomAliens.length)];
+        alienBullets.push({
+          x: shooter.x + shooter.width / 2 - 2,
+          y: shooter.y + shooter.height,
+          width: 4,
+          height: 10,
+          dy: 4
+        });
+      }
+      lastAlienShoot = currentTime;
+    }
+  }
+
+  function updateMystery(currentTime) {
+    if (!activeMystery && currentTime - lastMysteryTime > mysteryInterval) {
+      const shipWidth = 50;
+      const shipHeight = 20;
+      const fromLeft = Math.random() < 0.5;
+      const x = fromLeft ? -shipWidth : canvas.width;
+      const y = 50;
+      const speed = fromLeft ? 2 : -2;
+      mysteryShip = { x: x, y: y, width: shipWidth, height: shipHeight, speed: speed };
+      activeMystery = true;
+      lastMysteryTime = currentTime;
+    }
+    if (activeMystery && mysteryShip) {
+      mysteryShip.x += mysteryShip.speed;
+      if (mysteryShip.x > canvas.width + 60 || mysteryShip.x < -60) {
+        activeMystery = false;
+        mysteryShip = null;
+      }
+    }
+  }
+
+  function rectsIntersect(r1, r2) {
+    return r1.x < r2.x + r2.width &&
+           r1.x + r1.width > r2.x &&
+           r1.y < r2.y + r2.height &&
+           r1.y + r1.height > r2.y;
+  }
+
+  function update(currentTime) {
+    updatePlayer();
+    updatePlayerBullet();
+    updateAlienBullets();
+    updateAliens(currentTime);
+    spawnAlienBullet(currentTime);
+    updateMystery(currentTime);
+
+    if (!justKilledAlien) {
+      if (checkInvadersReachedBottom()) return;
+    }
+    justKilledAlien = false;
+
+    if (!aliens.some(a => a.alive)) {
+      level++;
+      createAliens();
+      playerBullet = null;
+      alienBullets = [];
+    }
+  }
+
+  function render() {
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    drawPlayer();
+    drawAliens();
+    drawBunkers();
+    drawBullets();
+    drawMystery();
+    drawScore();
+  }
+
+  function gameLoop(currentTime) {
+    if (gameState !== 'playing') return;
+    update(currentTime);
+    render();
+    requestAnimationFrame(gameLoop);
+  }
+
+  window.addEventListener('keydown', (e) => {
+    keys[e.key] = true;
+    if (gameState === 'waiting' || gameState === 'gameover') {
+      if (e.key === 'Enter') {
+        startGame();
+      }
+    }
+  });
+  window.addEventListener('keyup', (e) => {
+    keys[e.key] = false;
+  });
+
+  overlay.style.display = 'flex';
+})();
+</script>
+</body>
+</html>
